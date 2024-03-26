@@ -1,0 +1,302 @@
+
+#define FONA_RST 4
+//#if (defined(__AVR__) || defined(ESP8266)) && !defined(__AVR_ATmega2560__)
+#include <Wire.h>
+#include <TimeLib.h>
+#include <DS1307RTC.h>
+#include <Time.h>
+#include <TimeAlarms.h>
+#include <SoftwareSerial.h>
+#include <AccelStepper.h>
+//#include <neotimer.h>
+#include "HUSKYLENS.h" 
+#include "ParserLib.h"
+#include "Adafruit_FONA.h"
+
+#define FONA_RX 2
+#define FONA_TX 3
+
+char replybuffer[255];
+
+AccelStepper stepper(AccelStepper::FULL4WIRE, 8, 9, 10, 11);
+
+//SoftwareSerial fonaSS = SoftwareSerial(FONA_TX, FONA_RX);
+//SoftwareSerial *fonaSerial = &fonaSS;
+
+//#else
+// On Leonardo/M0/etc, others with hardware serial, use hardware serial!
+HardwareSerial *fonaSerial = &Serial1;
+
+//#endif
+
+// Use this for FONA 800 and 808s
+Adafruit_FONA fona = Adafruit_FONA(FONA_RST);
+// Use this one for FONA 3G
+//Adafruit_FONA_3G fona = Adafruit_FONA_3G(FONA_RST);
+
+uint8_t readline(char *buff, uint8_t maxbuff, uint16_t timeout = 0);
+
+char smsBuffer[250];
+char fonaNotificationBuffer[64];          //for notifications from the FONA
+
+//tmElements_t time_t;
+
+//Neotimer stepperTimer = Neotimer(20000);
+//Neotimer hourTimer = Neotimer(); // 1 second timer
+
+
+
+HUSKYLENS huskylens;
+//HUSKYLENS green line >> SDA; blue line >> SCL
+void printResult(HUSKYLENSResult result);
+
+boolean isClean = false;
+
+void setup() {
+  while (!Serial);
+  Serial.begin(115200);
+  
+  
+  Wire.begin();
+  while (!huskylens.begin(Wire))
+  {
+      Serial.println(F("Begin failed!"));
+      Serial.println(F("1.Please recheck the \"Protocol Type\" in HUSKYLENS (General Settings>>Protocol Type>>I2C)"));
+      Serial.println(F("2.Please recheck the connection."));
+      delay(100);
+  }
+
+  // make it slow so its easy to read!
+  // Get Current Time from RTC and pass to Alarm function
+  tmElements_t tm;
+  RTC.read(tm);
+  setTime(tm.Hour,tm.Minute,tm.Second,tm.Day,tm.Month,tmYearToCalendar(tm.Year));      //Hour,Minute,Second,Day,Month,Year  Saurday
+
+  // Set speed of stepper motors
+  stepper.setMaxSpeed(1000);
+  stepper.setSpeed(50);  
+
+  Serial.println(F("FONA SMS caller ID test"));
+  Serial.println(F("Initializing....(May take 3 seconds)"));
+  // make it slow so its easy to read!
+  fonaSerial->begin(4800);
+  if (! fona.begin(*fonaSerial)) {
+    Serial.println(F("Couldn't find FONA"));
+    while(1);
+  }
+  Serial.println(F("FONA is OK"));
+
+  // Print SIM card IMEI number.
+  char imei[16] = {0}; // MUST use a 16 character buffer for IMEI!
+  uint8_t imeiLen = fona.getIMEI(imei);
+  if (imeiLen > 0) {
+    Serial.print("SIM card IMEI: "); Serial.println(imei);
+  }
+
+  fonaSerial->print("AT+CNMI=2,1\r\n");  //set up the FONA to send a +CMTI notification when an SMS is received
+
+  Serial.println("FONA Ready");  
+ //hourTimer.start();
+ //while(1);
+}
+
+void loop() {
+  Serial.println("Loop");  
+  char* bufPtr = fonaNotificationBuffer;    //handy buffer pointer
+  if (fona.available())      //any data available from the FONA?
+  {
+    int slot = 0;            //this will be the slot number of the SMS
+    int charCount = 0;
+    //Read the notification into fonaInBuffer
+    do  {
+      *bufPtr = fona.read();
+      Serial.write(*bufPtr);
+      delay(1);
+    } while ((*bufPtr++ != '\n') && (fona.available()) && (++charCount < (sizeof(fonaNotificationBuffer)-1)));
+    
+    //Add a terminal NULL to the notification string
+    *bufPtr = 0;
+
+    //Scan the notification string for an SMS received notification.
+    //  If it's an SMS message, we'll get the slot number in 'slot'
+    if (1 == sscanf(fonaNotificationBuffer, "+CMTI: " FONA_PREF_SMS_STORAGE ",%d", &slot)) {
+      Serial.print("slot: "); Serial.println(slot);
+      
+      char callerIDbuffer[32];  //we'll store the SMS sender number in here
+      
+      // Retrieve SMS sender address/phone number.
+      if (! fona.getSMSSender(slot, callerIDbuffer, 31)) {
+        Serial.println("Didn't find SMS message in slot!");
+      }
+      Serial.print(F("FROM: ")); Serial.println(callerIDbuffer);
+
+        // Retrieve SMS value.
+        uint16_t smslen;
+        if (fona.readSMS(slot, smsBuffer, 250, &smslen)) { // pass in buffer and max len!
+          Serial.println(smsBuffer);
+          AlarmSetup(smsBuffer);
+        }
+      //Send back an automatic response
+      Serial.println("Sending reponse...");
+      /*
+      if (!fona.sendSMS(callerIDbuffer, (char *)"Hey, I got your text!")) {
+        Serial.println(F("Failed"));
+      } else {
+        Serial.println(F("Sent!"));
+      }
+      */
+      // delete the original msg after it is processed
+      //   otherwise, we will fill up all the slots
+      //   and then we won't be able to receive SMS anymore
+     
+      if (fona.deleteSMS(slot)) {
+        Serial.println(F("OK!"));
+      } else {
+        Serial.print(F("Couldn't delete SMS in slot ")); Serial.println(slot);
+        fona.print(F("AT+CMGD=?\r\n"));
+      }
+    }
+  }
+  
+  //if(hourTimer.done()){
+    Serial.print(hourFormat12());
+    printDigits(minute());
+    printDigits(second());
+    Serial.println("");
+    Serial.println(dayStr(weekday()));
+    Serial.print(monthStr(month()));  
+    Serial.print("  ");
+    Serial.print(day());
+    Serial.print("  ");
+    Serial.println(year());
+    Alarm.delay(100); // wait one second between clock display
+    //hourTimer.start();
+  //}
+  /*
+  if(stepperTimer.done()){
+      Serial.println("stepperTimer.done()");  
+      stepperTimer.reset();
+      }
+  if(stepperTimer.waiting()){
+      Serial.println("stepperTimer.waiting()");  
+      //stepper.runSpeed();
+      if(isClean){
+        stepper.runToNewPosition(1000);
+      }
+      else{
+        
+      }
+  }
+  */
+  
+  if (!huskylens.request()) Serial.println(F("Fail to request data from HUSKYLENS, recheck the connection!"));
+  else if(!huskylens.isLearned()) Serial.println(F("Nothing learned, press learn button on HUSKYLENS to learn one!"));
+  else if(!huskylens.available()) Serial.println(F("No block or arrow appears on the screen!"));
+  
+  else
+    {
+        Serial.println(F("###########"));
+        while (huskylens.available())
+        {
+            HUSKYLENSResult result = huskylens.read();
+            printResult(result);
+        }    
+    }
+    
+}
+
+
+
+void delsms(){
+  for (int i=0; i<10; i++){
+      int pos=fona.deleteSMS(0);
+      if (pos!=0){ 
+        if (fona.deleteSMS(pos)==1){}
+        else {}
+      }
+    } 
+}
+
+void AlarmSetup(char timeBuffer[]){
+  Serial.println(timeBuffer);
+
+  //char demo[] = "11:1332323:3232";
+  int itemLength = strlen(timeBuffer);
+
+  Parser parser((byte*)timeBuffer, itemLength);
+  //int hourTime = String(&timeBuffer[0])+
+  int i = parser.Read_Int32(); 
+                   parser.Skip(1);
+  int hourTime =   parser.Read_Int32();
+                   parser.Skip(1);
+  int minuteTime = parser.Read_Int32();
+                   parser.Skip(1);
+  int secondTime = parser.Read_Int32();
+                   parser.Skip(1);
+  switch (i){
+    case 1:  Alarm.alarmRepeat(hourTime,minuteTime,secondTime, AlarmSetOne); break;                
+    case 2:  Alarm.alarmRepeat(hourTime,minuteTime,secondTime, AlarmSetTwo); break; 
+    case 4:  Alarm.alarmRepeat(hourTime,minuteTime,secondTime, AlarmSetThree); break; 
+    case 5:  Alarm.alarmRepeat(hourTime,minuteTime,secondTime, AlarmSetFour); break; 
+    default: break;
+  }
+}
+void AlarmSetOne(){
+  augerSpin(10000);
+  Serial.println("AlarmSetOne");    
+}
+
+void AlarmSetTwo(){ 
+  augerSpin(10000);
+  Serial.println("AlarmSetTwo");           
+}
+
+void AlarmSetThree(){ 
+  augerSpin(10000);
+  Serial.println("AlarmSetThree");           
+}
+
+void AlarmSetFour(){ 
+  augerSpin(10000);
+  Serial.println("AlarmSetFour");           
+}
+
+void augerSpin(int rotate){
+    //stepper.runToNewPosition(0);
+    //stepper.runToNewPosition(500);
+    stepper.runToNewPosition(10000);
+    //stepperTimer.start();
+}
+
+void useSMS(){}
+
+
+void printDigits(int digits){
+  Serial.print(":");
+  if(digits < 10)
+  {
+    Serial.print('0');
+  }  
+  Serial.print(digits);
+}
+
+void printResult(HUSKYLENSResult result){
+    if (result.command == COMMAND_RETURN_BLOCK){
+        Serial.println(String()+F("Block:xCenter=")+result.xCenter+F(",yCenter=")+result.yCenter+F(",width=")+result.width+F(",height=")+result.height+F(",ID=")+result.ID);
+        if (result.ID == 1){
+          Serial.println("ID 1 DETECTED");
+          isClean = 1;
+      }
+      else{
+          isClean = 0;
+          Serial.println("NOT DETECTED");
+      } 
+    }
+    else if (result.command == COMMAND_RETURN_ARROW){
+      Serial.println(String()+F("Arrow:xOrigin=")+result.xOrigin+F(",yOrigin=")+result.yOrigin+F(",xTarget=")+result.xTarget+F(",yTarget=")+result.yTarget+F(",ID=")+result.ID);
+       
+    }
+    else{
+        Serial.println("Object unknown!");
+    }
+}
